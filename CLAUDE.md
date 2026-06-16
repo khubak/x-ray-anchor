@@ -4,13 +4,17 @@ Instructions for Claude when contributing to this repository.
 
 ## What This Repo Is
 
-A library of Claude AI skills. Each skill is a focused, self-contained capability for Claude Code in VS Code and Cursor.
+A single Claude AI skill: **x-ray-anchor** — a pre-audit readiness report generator for Rust / Solana / Anchor programs. A focused, self-contained capability for Claude Code in VS Code and Cursor.
 
 ## Structure
 
 ```
-solidity-auditor/ # Security review of Solidity changes while you develop
-CLAUDE.md            # This file (read by Claude Code)
+SKILL.md      # The skill definition (read by Claude Code)
+README.md     # Human-facing overview
+VERSION       # Bumped automatically on merge via CI
+references/   # solana-vulns.md, threats.md, templates.md
+scripts/      # enumerate.sh, analyze_git_security.py, generate_svg.py
+CLAUDE.md     # This file (read by Claude Code)
 ```
 
 ## Rules

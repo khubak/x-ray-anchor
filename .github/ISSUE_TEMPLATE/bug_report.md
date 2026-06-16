@@ -20,6 +20,10 @@ What went wrong?
 
 What you expected instead.
 
+## Program analyzed
+
+<!-- Anchor or native Solana? Link the repo/program if public. -->
+
 ## Model
 
 <!-- e.g. claude-sonnet-4-6 -->
