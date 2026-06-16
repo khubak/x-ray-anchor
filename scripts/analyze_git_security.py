@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""Git history security analysis for Solidity repositories.
+"""Git history security analysis for Rust / Solana / Anchor repositories.
 
 Analyzes git history from a security researcher's perspective: fix commits,
-dangerous area changes, forked dependencies, technical debt, and developer
-patterns. Outputs structured JSON consumed by the x-ray skill.
+dangerous area changes, forked/overridden Cargo dependencies, technical debt,
+and developer patterns. Outputs structured JSON consumed by the x-ray-anchor skill.
 
 Usage:
-    python3 analyze_git_security.py --repo . --src-dir contracts
-    python3 analyze_git_security.py --repo . --src-dir contracts --json /tmp/out.json
+    python3 analyze_git_security.py --repo . --src-dir programs
+    python3 analyze_git_security.py --repo . --src-dir programs/onreapp/src --json /tmp/out.json
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import os
 import re
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -78,22 +75,12 @@ class Commit:
 #               + security_domain_overlap
 # ═══════════════════════════════════════════════════════════════
 
-# Phase 1: Intent classification
-# The commit gets ONE primary intent (highest-priority match), plus
-# optional topic tags from secondary matches. The primary intent sets
-# the base score; topic tags add smaller bonuses for cross-cutting
-# concerns (e.g. a "bug fix" that also mentions "oracle" pricing).
-#
-# This avoids pure additive keyword scoring (every word = points) while
-# still capturing the nuance that "fix oracle reentrancy" is more
-# interesting than just "fix bug".
-
 # Primary intent: first match wins, sets the base score
 _INTENT_RULES: list[tuple[str, list[re.Pattern], int, str]] = [
-    # (category, patterns, base_score, reason_label)
     ("security_explicit", [
-        re.compile(r"\b(security|vulnerab|exploit|attack|CVE-\d)\b", re.I),
+        re.compile(r"\b(security|vulnerab|exploit|attack|CVE-\d|unsound|soundness)\b", re.I),
         re.compile(r"\b(reentran|overflow|underflow|front.?run|malleab)\w*", re.I),
+        re.compile(r"\b(missing\s+(signer|owner)|signer\s+check|owner\s+check|type\s+cosplay)\b", re.I),
     ], 8, "explicit security language"),
 
     ("urgent_fix", [
@@ -108,7 +95,7 @@ _INTENT_RULES: list[tuple[str, list[re.Pattern], int, str]] = [
     ], 4, "bug fix"),
 
     ("hardening", [
-        re.compile(r"\b(harden|mitigat|protect|restrict|sanitiz|validat)\w*", re.I),
+        re.compile(r"\b(harden|mitigat|protect|restrict|sanitiz|validat|constrain)\w*", re.I),
     ], 2, "hardening/validation"),
 
     ("feature", [
@@ -117,32 +104,23 @@ _INTENT_RULES: list[tuple[str, list[re.Pattern], int, str]] = [
 
     ("maintenance", [
         re.compile(r"^\s*(docs?|chore|ci|test|style|build)\s*:", re.I),
-        re.compile(r"\b(readme|typo|format|lint|rename|refactor|cleanup|comment)\b", re.I),
+        re.compile(r"\b(readme|typo|format|lint|clippy|fmt|rename|refactor|cleanup|comment)\b", re.I),
         re.compile(r"\bchange\s+\w+\s+to\s+\w+\b", re.I),
     ], -3, "maintenance/cosmetic"),
 ]
 
-# Topic tags: checked independently of primary intent. Each adds a
-# small bonus (+2) if matched, capturing cross-cutting domain signals.
-# E.g. a "bug fix" mentioning "oracle" gets +2 for the oracle topic.
+# Topic tags: independent domain signals (Solana-flavored). Each adds +2.
 _TOPIC_TAGS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b(oracle|price|liquidat|slippage|MEV)\w*", re.I),
+    (re.compile(r"\b(oracle|price|liquidat|slippage|nav|pyth|switchboard|MEV)\w*", re.I),
      "involves oracle/pricing"),
-    (re.compile(r"\b(reentran|overflow|underflow|front.?run)\w*", re.I),
+    (re.compile(r"\b(reentran|overflow|underflow|cpi|pda|sysvar|realloc|close)\w*", re.I),
      "involves known vulnerability pattern"),
-    (re.compile(r"\b(ecrecover|permit|signature|nonce)\w*", re.I),
+    (re.compile(r"\b(ed25519|secp256k1|signature|nonce|approval|seeds|bump|signer)\w*", re.I),
      "involves signatures/auth"),
 ]
 
 
 def _classify_intent(subject: str) -> tuple[int, list[str]]:
-    """Classify commit message: one primary intent + topic tag bonuses.
-
-    Returns (total_score, list_of_reasons).
-    Primary intent = first matching category (categorical).
-    Topic tags = independent checks for domain relevance (small bonuses).
-    """
-    # Primary intent (first match wins)
     primary_score = 0
     reasons: list[str] = []
     primary_cat = None
@@ -156,13 +134,9 @@ def _classify_intent(subject: str) -> tuple[int, list[str]]:
     if primary_cat is None:
         reasons.append("unclassified")
 
-    # Topic tags: small bonuses for domain signals not captured by
-    # the primary intent. Only applied if primary intent is not
-    # already negative (maintenance/feature).
     if primary_score >= 0:
         for pattern, tag_reason in _TOPIC_TAGS:
             if pattern.search(subject) and tag_reason not in reasons:
-                # Don't double-count if primary already captured this
                 if primary_cat != "security_explicit" or "vulnerability pattern" not in tag_reason:
                     primary_score += 2
                     reasons.append(tag_reason)
@@ -170,43 +144,35 @@ def _classify_intent(subject: str) -> tuple[int, list[str]]:
     return primary_score, reasons
 
 
-# Phase 2: Structural diff analysis
-# Instead of scanning for keyword presence in diff text, this
-# phase counts ADDED vs REMOVED instances of code constructs
-# to determine the DIRECTION of change. A commit that adds
-# 3 require() and removes 1 is structurally different from one
-# that just moves them around.
-
-_GUARD_ADD = re.compile(r"^\+[^+].*\b(require|revert|assert)\s*\(", re.M)
-_GUARD_REM = re.compile(r"^-[^-].*\b(require|revert|assert)\s*\(", re.M)
+# Phase 2: Structural diff analysis — Anchor/Rust constructs.
+# Guards: require!/require_eq!/require_keys_eq!/assert!/return Err/.ok_or
+_GUARD_ADD = re.compile(
+    r"^\+[^+].*\b(require(_\w+)?!|assert(_\w+)?!|return\s+Err|\.ok_or)\s*[!(]?", re.M)
+_GUARD_REM = re.compile(
+    r"^-[^-].*\b(require(_\w+)?!|assert(_\w+)?!|return\s+Err|\.ok_or)\s*[!(]?", re.M)
+# Access control: Anchor Accounts constraints + signer checks
 _MOD_ADD = re.compile(
-    r"^\+[^+].*\b(onlyOwner|onlyRole|onlyAdmin|nonReentrant|whenNotPaused"
-    r"|initializer|modifier\s+only)\b", re.M)
+    r"^\+[^+].*(\bSigner\s*<|has_one\s*=|constraint\s*=|#\[access_control"
+    r"|\baddress\s*=|init_if_needed|require_keys_eq!|is_signer\b)", re.M)
 _MOD_REM = re.compile(
-    r"^-[^-].*\b(onlyOwner|onlyRole|onlyAdmin|nonReentrant|whenNotPaused"
-    r"|initializer|modifier\s+only)\b", re.M)
+    r"^-[^-].*(\bSigner\s*<|has_one\s*=|constraint\s*=|#\[access_control"
+    r"|\baddress\s*=|init_if_needed|require_keys_eq!|is_signer\b)", re.M)
+# Token movement / CPI / lamport transfers
 _XFER_CHANGE = re.compile(
-    r"^[+-][^+-].*\b(safeTransfer\w*|\.transfer\(|transferFrom|\.call\{value)", re.M)
+    r"^[+-][^+-].*\b(transfer_checked|token(_interface)?::transfer|mint_to|burn"
+    r"|invoke_signed|invoke\b|CpiContext|try_borrow_mut_lamports|system_program::transfer)", re.M)
+# Signature / auth / PDA-signing handling
 _SIG_CHANGE = re.compile(
-    r"^[+-][^+-].*\b(ecrecover|permit|ECDSA|EIP.?712|nonce\b)", re.M)
+    r"^[+-][^+-].*\b(ed25519|secp256k1|sysvar::instructions|load_instruction"
+    r"|invoke_signed|verify\w*approval|\bseeds\s*=|\bbump\b)", re.M)
+# Accounting / balance state
 _ACCT_CHANGE = re.compile(
-    r"^[+-][^+-].*\b(balance\w*|totalSupply|exchangeRate|index\b|reserve)", re.M)
+    r"^[+-][^+-].*\b(amount|supply|lamports|reserve|balance|exchange_rate|\bnav\b|\bprice\b)", re.M)
 
 
 def _analyze_diff_structure(diff_text: str) -> list[tuple[int, str]]:
-    """Detect structural changes in a unified diff.
-
-    Counts added (+) vs removed (-) lines for each construct category.
-    Both adding and removing guards are equally security-interesting —
-    adding guards may fix a vulnerability, removing guards may introduce
-    one. The direction is reported so auditors know what to look for,
-    but the score weights both equally.
-
-    Returns list of (score_delta, reason).
-    """
     results: list[tuple[int, str]] = []
 
-    # Guards: require/revert/assert — any change is security-relevant
     guards_added = len(_GUARD_ADD.findall(diff_text))
     guards_removed = len(_GUARD_REM.findall(diff_text))
     if guards_added > 0 or guards_removed > 0:
@@ -217,65 +183,60 @@ def _analyze_diff_structure(diff_text: str) -> list[tuple[int, str]]:
         else:
             results.append((2, f"rewrites runtime guards (+{guards_added}/-{guards_removed})"))
 
-    # Access modifiers — tightening and loosening both matter
     mods_added = len(_MOD_ADD.findall(diff_text))
     mods_removed = len(_MOD_REM.findall(diff_text))
     if mods_added > 0 or mods_removed > 0:
         if mods_added > mods_removed:
-            results.append((3, f"tightens access control (+{mods_added}/-{mods_removed})"))
+            results.append((3, f"tightens account/access constraints (+{mods_added}/-{mods_removed})"))
         elif mods_removed > mods_added:
-            results.append((3, f"loosens access control (+{mods_added}/-{mods_removed})"))
+            results.append((3, f"loosens account/access constraints (+{mods_added}/-{mods_removed})"))
         else:
-            results.append((2, f"rewrites access control (+{mods_added}/-{mods_removed})"))
+            results.append((2, f"rewrites account/access constraints (+{mods_added}/-{mods_removed})"))
 
-    # Transfer logic changes
     if _XFER_CHANGE.search(diff_text):
-        results.append((2, "changes token transfer logic"))
+        results.append((2, "changes token/CPI/lamport transfer logic"))
 
-    # Signature/auth changes
     if _SIG_CHANGE.search(diff_text):
-        results.append((2, "changes signature/auth handling"))
+        results.append((2, "changes signature/PDA-seed handling"))
 
-    # Accounting/balance changes
     if _ACCT_CHANGE.search(diff_text):
         results.append((1, "changes accounting/balance logic"))
 
     return results
 
+
 # ═══════════════════════════════════════════════════════════════
-# SECURITY AREA CLASSIFICATION
+# SECURITY AREA CLASSIFICATION (Solana / Anchor)
 # ═══════════════════════════════════════════════════════════════
 
 SECURITY_AREAS = {
     "access_control": [
-        r"onlyOwner", r"onlyRole", r"modifier\s+only", r"OwnableRoles",
-        r"AccessControl", r"require\(msg\.sender", r"Ownable2Step",
-        r"_checkOwner", r"hasRole", r"_checkRole", r"onlyAdmin",
+        r"\bSigner\s*<", r"has_one\s*=", r"constraint\s*=", r"#\[access_control",
+        r"require_keys_eq!", r"assert_keys_eq", r"\bis_signer\b", r"\.owner\b",
+        r"\bauthority\b", r"only_\w+", r"\baddress\s*=",
     ],
     "fund_flows": [
-        r"\.deposit\(", r"\.withdraw\(", r"\.transfer\(", r"\.mint\(",
-        r"\.burn\(", r"collateral", r"safeTransfer", r"balanceOf",
-        r"allowance", r"approve", r"_pay\b", r"_collect\b",
-        r"function\s+deposit", r"function\s+withdraw",
+        r"transfer_checked", r"token(_interface)?::transfer", r"\bmint_to\b",
+        r"\bburn\b", r"CpiContext", r"try_borrow_mut_lamports", r"\blamports\b",
+        r"system_program::transfer", r"fn\s+deposit", r"fn\s+withdraw", r"\bvault\b",
     ],
     "oracle_price": [
-        r"oracle", r"[Pp]rice", r"[Ff]eed", r"TWAP", r"markPrice",
-        r"indexPrice", r"latestRoundData", r"getPrice", r"EMA",
-        r"[Pp]rice[Hh]istory",
+        r"\bpyth\b", r"switchboard", r"get_price", r"price_no_older_than",
+        r"\boracle\b", r"\bnav\b", r"\bprice\b", r"\bfeed\b", r"twap",
     ],
     "liquidation": [
-        r"liquidat", r"backstop", r"ADL", r"[Dd]eleverage",
-        r"[Ii]nsurance", r"insolvenc", r"bankruptcy", r"badDebt",
-        r"isLiquidatable",
+        r"liquidat", r"\bhealth\b", r"collateral", r"bad_debt", r"insolven",
+        r"backstop", r"deleverage", r"isLiquidatable",
     ],
     "signatures": [
-        r"ecrecover", r"permit", r"[Ss]ignature", r"EIP.?712",
-        r"ECDSA", r"nonce", r"digest", r"_hashTypedData", r"v,\s*r,\s*s",
+        r"ed25519", r"secp256k1", r"sysvar.{0,3}instructions", r"invoke_signed",
+        r"\bseeds\s*=", r"\bbump\b", r"verify\w*approval", r"\bnonce\b", r"ecdsa",
+        r"load_instruction",
     ],
     "state_machines": [
-        r"[Ss]tatus\s*=", r"[Ss]tate\s*=", r"Phase\b", r"Stage\b",
-        r"[Ll]ifecycle", r"[Tt]ransition", r"[Pp]aused", r"[Ff]rozen",
-        r"isActive", r"onlyActive", r"whenNotPaused",
+        r"is_killed", r"kill_switch", r"\bpaused\b", r"\bfrozen\b", r"\bstatus\b",
+        r"\bstate\b\s*\.", r"lifecycle", r"transition", r"\bPhase\b", r"\bStage\b",
+        r"is_active", r"when_not_paused",
     ],
 }
 
@@ -285,64 +246,43 @@ _AREA_COMPILED = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# KNOWN LIBRARIES
+# KNOWN CRATES (Solana ecosystem)
 # ═══════════════════════════════════════════════════════════════
 
 KNOWN_LIBS = {
-    "openzeppelin": {
-        "patterns": ["openzeppelin-contracts", "openzeppelin"],
-        "upstream_pragma": ["0.8."],
-        "label": "OpenZeppelin",
-    },
-    "solady": {
-        "patterns": ["solady"],
-        "upstream_pragma": ["0.8."],
-        "label": "Solady",
-    },
-    "uniswap_v2": {
-        "patterns": ["uniswap", "univ2", "gte-univ2", "v2-core", "v2-periphery"],
-        "upstream_pragma": [">=0.5.", "=0.5.", ">=0.6.", "=0.6."],
-        "label": "Uniswap V2",
-    },
-    "uniswap_v3": {
-        "patterns": ["v3-core", "v3-periphery", "uniswap-v3"],
-        "upstream_pragma": [">=0.5.", "=0.7.", ">=0.7."],
-        "label": "Uniswap V3",
-    },
-    "aave": {
-        "patterns": ["aave"],
-        "upstream_pragma": ["0.8."],
-        "label": "Aave",
-    },
-    "chainlink": {
-        "patterns": ["chainlink"],
-        "upstream_pragma": ["0.8.", "0.6."],
-        "label": "Chainlink",
-    },
-    "permit2": {
-        "patterns": ["permit2"],
-        "upstream_pragma": ["0.8."],
-        "label": "Permit2",
-    },
+    "anchor-lang": "Anchor (anchor-lang)",
+    "anchor-spl": "Anchor SPL (anchor-spl)",
+    "solana-program": "Solana Program",
+    "spl-token": "SPL Token",
+    "spl-token-2022": "SPL Token-2022",
+    "spl-associated-token-account": "SPL Associated Token Account",
+    "mpl-token-metadata": "Metaplex Token Metadata",
+    "mpl-bubblegum": "Metaplex Bubblegum (cNFT)",
+    "pyth-sdk-solana": "Pyth",
+    "pyth-solana-receiver-sdk": "Pyth (receiver)",
+    "switchboard-v2": "Switchboard V2",
+    "switchboard-on-demand": "Switchboard On-Demand",
+    "jupiter-amm-interface": "Jupiter",
+    "clockwork-sdk": "Clockwork",
 }
-
-SKIP_LIB_ANALYSIS = {"forge-std", "ds-test", "forge-std-1"}
 
 # ═══════════════════════════════════════════════════════════════
 # PATH CLASSIFICATION
 # ═══════════════════════════════════════════════════════════════
 
-SOURCE_SUFFIXES = (".sol", ".vy", ".rs", ".cairo", ".move")
-TEST_HINTS = ("test/", "tests/", "spec/", ".t.sol", ".spec.", "__tests__", "fuzz/")
+SOURCE_SUFFIXES = (".rs",)
+TEST_HINTS = (
+    "/tests/", "/test/", "trident-tests/", "/fuzz/", "__tests__/",
+    ".test.", ".spec.", "/benches/",
+)
 EXCLUDE_DIRS = (
-    "/lib/", "/node_modules/", "/forge-std/", "/out/",
-    "/broadcast/", "/artifacts/", "/cache/",
+    "/target/", "/node_modules/", "/.anchor/", "/dist/", "/.cargo/",
 )
 
 
 def classify_path(path: str, src_dir: str) -> tuple[bool, bool]:
     """Classify a path as (is_source, is_test)."""
-    lowered = path.lower()
+    lowered = "/" + path.lower()
     is_test = any(hint in lowered for hint in TEST_HINTS)
 
     if not any(path.endswith(s) for s in SOURCE_SUFFIXES):
@@ -356,21 +296,20 @@ def classify_path(path: str, src_dir: str) -> tuple[bool, bool]:
 
 
 def find_source_files(repo: str, src_dir: str) -> list[str]:
-    """Walk filesystem for current .sol files in src_dir."""
+    """Walk filesystem for current .rs files in src_dir."""
     result = []
     src_path = os.path.join(repo, src_dir)
     if not os.path.isdir(src_path):
         return result
     for root, dirs, files in os.walk(src_path):
-        # Prune excluded directories
         dirs[:] = [d for d in dirs if d not in (
-            "test", "tests", "lib", "node_modules", "forge-std",
-            "out", "broadcast", "artifacts", "cache", "script",
+            "target", "tests", "test", "trident-tests", "node_modules",
+            ".anchor", "fuzz", "benches", ".cargo",
         )]
         for fname in files:
-            if fname.endswith(".sol"):
+            if fname.endswith(".rs"):
                 rel = os.path.relpath(os.path.join(root, fname), repo)
-                result.append(rel)
+                result.append(rel.replace("\\", "/"))
     return sorted(result)
 
 
@@ -379,9 +318,15 @@ def find_source_files(repo: str, src_dir: str) -> list[str]:
 # ═══════════════════════════════════════════════════════════════
 
 def run_git(repo: str, *args: str, allow_fail: bool = False) -> str:
+    # Force UTF-8 decoding with replacement: git output (author names, diffs) is
+    # UTF-8, but Windows subprocess otherwise defaults to the locale codepage
+    # (cp1252) and raises UnicodeDecodeError on bytes undefined there.
     cmd = ["git", "-C", repo] + list(args)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=True,
+        )
         return result.stdout
     except subprocess.CalledProcessError:
         if allow_fail:
@@ -392,7 +337,6 @@ def run_git(repo: str, *args: str, allow_fail: bool = False) -> str:
 def parse_git_log(repo: str, src_dir: str) -> list[Commit]:
     """Parse full git history in a single call."""
     sep = "<<SEP>>"
-    # Use %x00 in git format to produce null bytes in output (not in args)
     fmt = f"COMMIT_START{sep}%H{sep}%h{sep}%aI{sep}%aN{sep}%P{sep}%s"
     raw = run_git(repo, "log", "--numstat", f"--format={fmt}")
 
@@ -420,7 +364,7 @@ def parse_git_log(repo: str, src_dir: str) -> list[Commit]:
                     deleted = int(parts[1]) if parts[1] != "-" else 0
                 except ValueError:
                     continue
-                path = parts[2]
+                path = parts[2].replace("\\", "/")
                 is_src, is_tst = classify_path(path, src_dir)
                 current.files.append(FileChange(
                     path=path, added=added, deleted=deleted,
@@ -461,7 +405,6 @@ def analyze_repo_shape(commits: list[Commit], src_dir: str) -> dict:
     except ValueError:
         spread = 0
 
-    # Detect bulk import
     bulk_sha = None
     signals = []
     total_source_added = sum(
@@ -469,7 +412,6 @@ def analyze_repo_shape(commits: list[Commit], src_dir: str) -> dict:
         for c in source_commits
     )
     if source_commits:
-        # Sort by source lines added, descending
         biggest = max(source_commits, key=lambda c: sum(f.added for f in c.source_files))
         biggest_added = sum(f.added for f in biggest.source_files)
         if total_source_added > 0 and biggest_added / total_source_added > 0.85:
@@ -478,7 +420,6 @@ def analyze_repo_shape(commits: list[Commit], src_dir: str) -> dict:
                 f"~{biggest_added} source lines arrived in 1 commit ({bulk_sha})"
             )
 
-    # Classification
     classification = "normal_dev"
     if len(source_commits) <= 1:
         classification = "squashed_import"
@@ -488,7 +429,6 @@ def analyze_repo_shape(commits: list[Commit], src_dir: str) -> dict:
         signals.append(f"Only {len(source_commits)} source commits in {spread} days")
 
     if bulk_sha and classification == "normal_dev":
-        # Has bulk import but also real development after
         signals.append("Bulk import detected with subsequent development")
 
     signals.append(f"Date spread: {spread} days")
@@ -516,20 +456,8 @@ def score_commit(
     diff_text: str = "",
     file_areas_cache: dict[str, list[str]] | None = None,
 ) -> tuple[int, list[str]]:
-    """Score a commit for security-fix likelihood.
-
-    Uses a multi-phase approach:
-      1. Classify message intent (categorical, first-match)
-      2. Analyze diff structure (directional: added vs removed guards)
-      3. Check security domain overlap (cross-ref with SECURITY_AREAS)
-      4. Apply shape modifiers (focus, churn)
-
-    The final score is the sum of phase contributions, floored at 0.
-    """
     reasons: list[str] = []
 
-    # ── Phase 1: Intent classification ──────────────────────────
-    # Primary intent (categorical) + topic tag bonuses
     intent_score, intent_reasons = _classify_intent(commit.subject)
     reasons.extend(intent_reasons)
 
@@ -537,19 +465,12 @@ def score_commit(
     if not src_files:
         return max(intent_score, 0), reasons
 
-    # ── Phase 2: Structural diff analysis ───────────────────────
-    # Counts added vs removed code constructs to determine the
-    # direction of change, not just presence of keywords
     structural_score = 0
     if diff_text:
         for delta, reason in _analyze_diff_structure(diff_text):
             structural_score += delta
             reasons.append(reason)
 
-    # ── Phase 3: Security domain overlap ────────────────────────
-    # Cross-references changed files against SECURITY_AREAS
-    # classification. A commit touching multiple security domains
-    # (e.g. access_control + fund_flows) is more interesting.
     domain_score = 0
     if file_areas_cache is not None:
         touched_domains: set[str] = set()
@@ -566,21 +487,16 @@ def score_commit(
             domain_score = 1
             reasons.append(f"touches {next(iter(touched_domains))} code")
 
-    # ── Phase 4: Shape modifiers ────────────────────────────────
     shape_score = 0
-
-    # Focused changes (few files) are more likely targeted fixes
     if 1 <= len(src_files) <= 3:
         shape_score += 2
         reasons.append(f"focused change ({len(src_files)} source files)")
 
-    # Net code removal suggests removing vulnerable paths
     net_deleted = sum(f.deleted - f.added for f in src_files)
     if net_deleted > 0:
         shape_score += 1
         reasons.append("net code removal")
 
-    # Large bulk changes are likely features or refactors
     src_churn = commit.source_churn
     if src_churn > 2000:
         shape_score -= 4
@@ -589,7 +505,6 @@ def score_commit(
         shape_score -= 2
         reasons.append("large change (>500 source lines)")
 
-    # Test co-change is informative (either direction)
     if commit.test_files:
         shape_score += 1
         reasons.append("includes test changes")
@@ -605,16 +520,10 @@ def find_fix_candidates(
     limit: int,
     file_areas_cache: dict[str, list[str]] | None = None,
 ) -> list[dict]:
-    """Score all commits, return top N fix candidates.
-
-    Uses intent classification + structural diff analysis + security
-    domain cross-referencing to identify likely security fixes.
-    """
     candidates = []
     for commit in commits:
         if commit.is_merge:
             continue
-        # Get diff text for source-touching commits only
         diff_text = ""
         if commit.source_files:
             diff_text = run_git(
@@ -658,7 +567,6 @@ def _read_file_safe(path: str) -> str:
 
 
 def classify_file_areas(content: str) -> list[str]:
-    """Determine which security areas a file's content touches."""
     areas = []
     for area, patterns in _AREA_COMPILED.items():
         for pat in patterns:
@@ -669,40 +577,20 @@ def classify_file_areas(content: str) -> list[str]:
 
 
 def _build_file_areas_cache(repo: str, src_dir: str) -> dict[str, list[str]]:
-    """Build a mapping of file paths to their security area classifications.
-
-    Shared by both fix candidate scoring (Phase 3: domain overlap) and
-    dangerous area analysis.
-    """
     cache: dict[str, list[str]] = {}
     src_path = os.path.join(repo, src_dir)
     if os.path.isdir(src_path):
         for root, dirs, files in os.walk(src_path):
             dirs[:] = [d for d in dirs if d not in (
-                "test", "tests", "lib", "node_modules", "script",
+                "target", "tests", "test", "trident-tests", "node_modules",
+                ".anchor", "fuzz", "benches",
             )]
             for fname in files:
-                if fname.endswith(".sol"):
+                if fname.endswith(".rs"):
                     full = os.path.join(root, fname)
-                    rel = os.path.relpath(full, repo)
+                    rel = os.path.relpath(full, repo).replace("\\", "/")
                     content = _read_file_safe(full)
                     cache[rel] = classify_file_areas(content)
-
-    # Also classify files in lib/ that are source-like
-    lib_path = os.path.join(repo, "lib")
-    if os.path.isdir(lib_path):
-        for root, dirs, files in os.walk(lib_path):
-            dirs[:] = [d for d in dirs if d not in (
-                "test", "tests", "node_modules", "forge-std",
-            )]
-            for fname in files:
-                if fname.endswith(".sol"):
-                    full = os.path.join(root, fname)
-                    rel = os.path.relpath(full, repo)
-                    if rel not in cache:
-                        content = _read_file_safe(full)
-                        cache[rel] = classify_file_areas(content)
-
     return cache
 
 
@@ -712,11 +600,9 @@ def analyze_dangerous_areas(
     repo: str,
     file_areas_cache: dict[str, list[str]] | None = None,
 ) -> dict:
-    """Group commits by security area they affect."""
     if file_areas_cache is None:
         file_areas_cache = _build_file_areas_cache(repo, src_dir)
 
-    # Map commits to areas
     result: dict[str, dict] = {}
     for area in SECURITY_AREAS:
         result[area] = {"commit_count": 0, "files": set(), "commits": []}
@@ -739,12 +625,10 @@ def analyze_dangerous_areas(
                 "subject": commit.subject[:80],
             })
 
-    # Convert sets to sorted lists, remove empty areas
     final = {}
     for area, data in result.items():
         if data["commit_count"] > 0:
             data["files"] = sorted(data["files"])
-            # Cap commit list at 15
             if len(data["commits"]) > 15:
                 data["commits"] = data["commits"][:15]
                 data["truncated"] = True
@@ -760,18 +644,13 @@ def analyze_dangerous_areas(
 def analyze_late_changes(
     commits: list[Commit], src_dir: str, days: int
 ) -> dict:
-    """Find commits touching source in the last N days of repo activity."""
     if not commits:
         return {
-            "window_days": days,
-            "cutoff_date": None,
-            "latest_commit_date": None,
-            "late_commits": [],
-            "source_without_test_count": 0,
+            "window_days": days, "cutoff_date": None, "latest_commit_date": None,
+            "late_commits": [], "source_without_test_count": 0,
             "total_late_source_commits": 0,
         }
 
-    # Find latest date
     dates = []
     for c in commits:
         try:
@@ -781,11 +660,8 @@ def analyze_late_changes(
 
     if not dates:
         return {
-            "window_days": days,
-            "cutoff_date": None,
-            "latest_commit_date": None,
-            "late_commits": [],
-            "source_without_test_count": 0,
+            "window_days": days, "cutoff_date": None, "latest_commit_date": None,
+            "late_commits": [], "source_without_test_count": 0,
             "total_late_source_commits": 0,
         }
 
@@ -829,167 +705,136 @@ def analyze_late_changes(
 
 
 # ═══════════════════════════════════════════════════════════════
-# SECTION 5: FORKED DEPENDENCIES
+# SECTION 5: FORKED / OVERRIDDEN CARGO DEPENDENCIES
+#
+# Solana analog of "internalized library = hidden attack surface":
+#   - git deps (a crate pulled from a fork instead of crates.io)
+#   - path deps (a local, possibly-modified vendored crate)
+#   - [patch.*] overrides (silently replace a published crate with a fork —
+#     the classic supply-chain risk; upstream security fixes won't propagate)
 # ═══════════════════════════════════════════════════════════════
 
-def _detect_lib_identity(dirname: str) -> str | None:
-    """Match a lib directory name to a known library."""
-    lower = dirname.lower()
-    for lib_id, info in KNOWN_LIBS.items():
-        for pattern in info["patterns"]:
-            if pattern.lower() in lower:
-                return lib_id
-    return None
-
-
-def _extract_pragmas(sol_dir: str) -> list[str]:
-    """Extract unique pragma versions from .sol files in a directory."""
-    pragmas = set()
-    if not os.path.isdir(sol_dir):
-        return []
-    for root, _, files in os.walk(sol_dir):
+def _find_cargo_tomls(repo: str) -> list[str]:
+    result = []
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in (
+            "target", "node_modules", ".anchor", ".git", ".cargo",
+        )]
         for fname in files:
-            if not fname.endswith(".sol"):
-                continue
-            try:
-                with open(os.path.join(root, fname), "r", errors="replace") as f:
-                    for line in f:
-                        m = re.match(r"\s*pragma\s+solidity\s+(.+?)\s*;", line)
-                        if m:
-                            pragmas.add(m.group(1).strip())
-                            break
-            except (OSError, IOError):
-                continue
-    return sorted(pragmas)
+            if fname == "Cargo.toml":
+                result.append(os.path.join(root, fname))
+    return sorted(result)
 
 
-def _count_sol_files(dirpath: str) -> int:
-    count = 0
-    if not os.path.isdir(dirpath):
-        return 0
-    for root, _, files in os.walk(dirpath):
-        for f in files:
-            if f.endswith(".sol"):
-                count += 1
-    return count
+# crate-name = { git = "...", rev = "..." }   OR   crate-name = "1.2.3"
+_DEP_INLINE = re.compile(
+    r'^\s*([A-Za-z0-9_-]+)\s*=\s*\{(.+)\}\s*$')
+_DEP_SIMPLE = re.compile(
+    r'^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"]+)"\s*$')
+_KV = re.compile(r'(\w+)\s*=\s*"([^"]+)"')
 
 
-def _check_pragma_mismatch(
-    found_pragmas: list[str], expected_prefixes: list[str]
-) -> list[str]:
-    """Check if pragmas differ from expected upstream versions."""
-    notes = []
-    for pragma in found_pragmas:
-        matches_expected = any(
-            pragma.startswith(prefix) or prefix in pragma
-            for prefix in expected_prefixes
-        )
-        if not matches_expected:
-            notes.append(f"Pragma '{pragma}' differs from expected upstream versions")
-    return notes
+def _parse_cargo_toml(path: str) -> dict:
+    """Line-based parse: returns deps/patches by section. No toml lib needed."""
+    git_deps, path_deps, patch_overrides, simple = [], [], [], []
+    section = None
+    rel = os.path.basename(os.path.dirname(path))
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return {"git": [], "path": [], "patch": [], "simple": []}
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s.strip("[]").strip()
+            continue
+        if not s or s.startswith("#"):
+            continue
+        is_dep_section = section and (
+            "dependencies" in section or "build-dependencies" in section)
+        is_patch = section and section.startswith("patch")
+
+        m = _DEP_INLINE.match(line)
+        if m:
+            name, body = m.group(1), m.group(2)
+            kvs = dict(_KV.findall(body))
+            if is_patch:
+                patch_overrides.append({
+                    "name": name, "registry": section,
+                    "source": kvs.get("git") or kvs.get("path") or "?",
+                    "rev": kvs.get("rev") or kvs.get("branch") or kvs.get("tag"),
+                    "from_file": rel,
+                })
+            elif is_dep_section:
+                if "git" in kvs:
+                    git_deps.append({
+                        "name": name, "git": kvs["git"],
+                        "rev": kvs.get("rev") or kvs.get("branch") or kvs.get("tag"),
+                        "from_file": rel,
+                    })
+                elif "path" in kvs:
+                    path_deps.append({
+                        "name": name, "path": kvs["path"], "from_file": rel,
+                    })
+                elif "version" in kvs:
+                    simple.append({"name": name, "version": kvs["version"], "from_file": rel})
+            continue
+
+        if is_dep_section:
+            m2 = _DEP_SIMPLE.match(line)
+            if m2:
+                simple.append({"name": m2.group(1), "version": m2.group(2), "from_file": rel})
+
+    return {"git": git_deps, "path": path_deps, "patch": patch_overrides, "simple": simple}
 
 
 def analyze_forked_deps(repo: str) -> dict:
-    """Detect internalized/forked libraries."""
-    lib_dir = os.path.join(repo, "lib")
-    detected = []
+    git_deps, path_deps, patch_overrides, simple = [], [], [], []
+    for toml in _find_cargo_tomls(repo):
+        parsed = _parse_cargo_toml(toml)
+        git_deps.extend(parsed["git"])
+        path_deps.extend(parsed["path"])
+        patch_overrides.extend(parsed["patch"])
+        simple.extend(parsed["simple"])
 
-    # Check current .gitmodules for active submodules
-    gitmodules_path = os.path.join(repo, ".gitmodules")
-    active_submodules = set()
-    if os.path.isfile(gitmodules_path):
-        try:
-            with open(gitmodules_path, "r") as f:
-                for line in f:
-                    m = re.match(r"\s*path\s*=\s*(.+)", line)
-                    if m:
-                        active_submodules.add(m.group(1).strip())
-        except (OSError, IOError):
-            pass
+    # Build a view of known security-critical crates and how they're sourced.
+    sourced: dict[str, dict] = {}
+    for d in simple:
+        if d["name"] in KNOWN_LIBS and d["name"] not in sourced:
+            sourced[d["name"]] = {"name": d["name"], "label": KNOWN_LIBS[d["name"]],
+                                  "source_type": "crates.io", "detail": d["version"]}
+    for d in git_deps:
+        sourced[d["name"]] = {"name": d["name"],
+                              "label": KNOWN_LIBS.get(d["name"], d["name"]),
+                              "source_type": "git", "detail": d["git"], "rev": d.get("rev")}
+    for d in path_deps:
+        sourced[d["name"]] = {"name": d["name"],
+                              "label": KNOWN_LIBS.get(d["name"], d["name"]),
+                              "source_type": "path", "detail": d["path"]}
+    for d in patch_overrides:
+        sourced[d["name"]] = {"name": d["name"],
+                              "label": KNOWN_LIBS.get(d["name"], d["name"]),
+                              "source_type": "patch", "detail": d["source"], "rev": d.get("rev")}
 
-    # Scan lib/ directories
-    if os.path.isdir(lib_dir):
-        for entry in sorted(os.listdir(lib_dir)):
-            entry_path = os.path.join(lib_dir, entry)
-            if not os.path.isdir(entry_path):
-                continue
-            if entry in SKIP_LIB_ANALYSIS:
-                continue
-
-            lib_rel = f"lib/{entry}"
-            lib_id = _detect_lib_identity(entry)
-            sol_count = _count_sol_files(entry_path)
-
-            if sol_count == 0:
-                continue
-
-            is_submodule = lib_rel in active_submodules
-            is_internalized = not is_submodule and not os.path.isdir(
-                os.path.join(entry_path, ".git")
-            )
-            # Also check for submodule pointer file (single-line file with commit hash)
-            gitfile = os.path.join(entry_path, ".git")
-            if os.path.isfile(gitfile):
-                is_submodule = True
-                is_internalized = False
-
-            pragmas = _extract_pragmas(entry_path)
-            notes = []
-
-            if lib_id and lib_id in KNOWN_LIBS:
-                label = KNOWN_LIBS[lib_id]["label"]
-                expected = KNOWN_LIBS[lib_id]["upstream_pragma"]
-                pragma_notes = _check_pragma_mismatch(pragmas, expected)
-                notes.extend(pragma_notes)
-                if is_internalized:
-                    notes.append(f"Internalized (not a submodule) — may contain modifications from upstream {label}")
-            else:
-                label = entry
-                if is_internalized:
-                    notes.append("Internalized (not a submodule) — unknown upstream")
-
-            detected.append({
-                "name": entry,
-                "path": lib_rel,
-                "known_upstream": label if lib_id else None,
-                "is_submodule": is_submodule,
-                "is_internalized": is_internalized,
-                "sol_file_count": sol_count,
-                "pragma_versions": pragmas,
-                "notes": notes,
-            })
-
-    # Check git history for removed submodules
-    removed = []
-    gitmodules_log = run_git(
-        repo, "log", "-p", "--", ".gitmodules",
-        allow_fail=True,
-    )
-    if gitmodules_log:
-        current_sha = None
-        current_subject = None
-        for line in gitmodules_log.splitlines():
-            m = re.match(r"^commit\s+([a-f0-9]+)", line)
-            if m:
-                current_sha = m.group(1)[:7]
-                current_subject = None
-                continue
-            if line.startswith("    ") and current_subject is None:
-                current_subject = line.strip()[:80]
-                continue
-            # Detect removed submodule path lines
-            m = re.match(r"^-\s*path\s*=\s*(.+)", line)
-            if m and current_sha:
-                removed_path = m.group(1).strip()
-                removed.append({
-                    "path": removed_path,
-                    "removed_in_sha": current_sha,
-                    "subject": current_subject or "",
-                })
+    notes = []
+    if patch_overrides:
+        notes.append(f"{len(patch_overrides)} [patch] override(s) — published crates silently "
+                     "replaced by forks; upstream security fixes will NOT auto-propagate")
+    for d in git_deps:
+        if d["name"] in KNOWN_LIBS:
+            notes.append(f"{d['name']} pulled from git fork ({d['git']}) instead of crates.io")
+    if path_deps:
+        notes.append(f"{len(path_deps)} path (vendored/local) dependency(ies) — may contain "
+                     "local modifications from upstream")
 
     return {
-        "detected_libs": detected,
-        "removed_submodules": removed,
+        "git_dependencies": git_deps,
+        "path_dependencies": path_deps,
+        "patch_overrides": patch_overrides,
+        "known_critical": [sourced[k] for k in sorted(sourced)],
+        "notes": notes,
     }
 
 
@@ -998,15 +843,14 @@ def analyze_forked_deps(repo: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 _DEBT_RE = re.compile(
-    r"(?://|/\*)\s*(TODO|FIXME|HACK|XXX)\b[:\s]*(.*)",
+    r"(?://|/\*)\s*(TODO|FIXME|HACK|XXX|SAFETY|AUDIT|BUG)\b[:\s]*(.*)",
     re.IGNORECASE,
 )
 
-BLAME_CAP = 20  # Max files to blame (performance guard)
+BLAME_CAP = 20
 
 
 def find_tech_debt(source_files: list[str], repo: str) -> dict:
-    """Find TODO/FIXME/HACK/XXX in source files with git blame."""
     items = []
     files_with_debt = set()
 
@@ -1031,11 +875,9 @@ def find_tech_debt(source_files: list[str], repo: str) -> dict:
                     "blame_date": None,
                 })
 
-    # Git blame for attribution (capped)
     blame_files = sorted(files_with_debt)[:BLAME_CAP]
     capped = len(files_with_debt) > BLAME_CAP
 
-    # Build a lookup: file -> {line: (author, date)}
     blame_lookup: dict[str, dict[int, tuple[str, str]]] = {}
     for rel_path in blame_files:
         blame_out = run_git(
@@ -1049,7 +891,6 @@ def find_tech_debt(source_files: list[str], repo: str) -> dict:
         current_date = ""
         current_line = 0
         for bline in blame_out.splitlines():
-            # First line of each block: <sha> <orig_line> <final_line> [<count>]
             m = re.match(r"^[a-f0-9]{40}\s+\d+\s+(\d+)", bline)
             if m:
                 current_line = int(m.group(1))
@@ -1065,13 +906,11 @@ def find_tech_debt(source_files: list[str], repo: str) -> dict:
                 except (ValueError, OSError):
                     current_date = ""
             elif bline.startswith("\t"):
-                # Content line — save blame for this line number
                 if current_line > 0:
                     file_blame[current_line] = (current_author, current_date)
 
         blame_lookup[rel_path] = file_blame
 
-    # Enrich items with blame
     for item in items:
         bl = blame_lookup.get(item["file"], {})
         info = bl.get(item["line"])
@@ -1099,8 +938,6 @@ def analyze_dev_patterns(
     fix_candidates: list[dict],
     bulk_import_sha: str | None,
 ) -> dict:
-    """Compute developer pattern metrics."""
-    # Filter out merge commits and optionally bulk import
     non_merge = [c for c in commits if not c.is_merge]
     source_commits = [c for c in non_merge if c.source_files]
     analysis_commits = source_commits
@@ -1110,27 +947,23 @@ def analyze_dev_patterns(
             if c.short_sha != bulk_import_sha
         ]
 
-    # 1. Test co-change rate
     if source_commits:
         with_tests = sum(1 for c in source_commits if c.test_files)
         test_co_change = with_tests / len(source_commits)
     else:
         test_co_change = 0.0
 
-    # 2. Fix without test rate
     fix_without_test = None
     if fix_candidates:
         no_test = sum(1 for f in fix_candidates if not f["test_changed"])
         fix_without_test = no_test / len(fix_candidates)
 
-    # 4. Avg commit size (excluding bulk import)
     if analysis_commits:
         avg_size = sum(c.source_churn for c in analysis_commits) / len(analysis_commits)
     else:
         avg_size = 0.0
     size_note = "excluding bulk import" if bulk_import_sha and len(analysis_commits) != len(source_commits) else None
 
-    # 5. Single developer percentage
     author_lines: dict[str, int] = {}
     for c in source_commits:
         added = sum(f.added for f in c.source_files)
@@ -1177,23 +1010,13 @@ def _unique(items: list[str]) -> list[str]:
 
 
 def detect_src_dir(repo: str) -> str:
-    """Auto-detect source directory from foundry.toml or common patterns."""
-    toml_path = os.path.join(repo, "foundry.toml")
-    if os.path.isfile(toml_path):
-        try:
-            with open(toml_path, "r") as f:
-                for line in f:
-                    m = re.match(r'\s*src\s*=\s*["\'](.+?)["\']', line)
-                    if m:
-                        return m.group(1).rstrip("/") + "/"
-        except (OSError, IOError):
-            pass
-
-    # Fallback: check common directories
-    for candidate in ["contracts/", "src/"]:
+    """Auto-detect source dir: Anchor programs/ → src/ fallback."""
+    if os.path.isdir(os.path.join(repo, "programs")):
+        return "programs/"
+    for candidate in ["src/", "program/", "."]:
         if os.path.isdir(os.path.join(repo, candidate)):
             return candidate
-    return "src/"
+    return "programs/"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1202,7 +1025,7 @@ def detect_src_dir(repo: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Git history security analysis for Solidity repositories",
+        description="Git history security analysis for Rust/Solana/Anchor repositories",
     )
     parser.add_argument("--repo", default=".", help="Path to git repository")
     parser.add_argument("--json", default=None, help="Output JSON to file (default: stdout)")
@@ -1213,13 +1036,11 @@ def main() -> int:
 
     repo = os.path.abspath(args.repo)
     src_dir = args.src_dir or detect_src_dir(repo)
-    # Ensure trailing slash for consistent prefix matching
     if not src_dir.endswith("/"):
         src_dir += "/"
 
     t0 = time.monotonic()
 
-    # Verify git repo
     try:
         head = run_git(repo, "rev-parse", "--short", "HEAD").strip()
     except subprocess.CalledProcessError:
@@ -1227,23 +1048,15 @@ def main() -> int:
         _write_output(err, args.json)
         return 2
 
-    # Detect current branch name
     try:
         branch = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     except subprocess.CalledProcessError:
         branch = "unknown"
 
-    # Phase 1: Collect git data
     commits = parse_git_log(repo, src_dir)
-
-    # Phase 2: Find source files
     source_files = find_source_files(repo, src_dir)
-
-    # Phase 3: Run analyzers
     repo_shape = analyze_repo_shape(commits, src_dir)
 
-    # Build file→security-area cache once, shared by fix detection
-    # and dangerous area analysis
     file_areas_cache = _build_file_areas_cache(repo, src_dir)
 
     fix_cands = find_fix_candidates(

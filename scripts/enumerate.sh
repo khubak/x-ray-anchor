@@ -1,31 +1,52 @@
 #!/bin/bash
-# Step 1: Enumerate source files, line counts, nSLOC, test stats, docs, commit, and git history stats
-# Usage: enumerate.sh <project-root> <src-dir>
-# Output: labeled sections consumed by the x-ray skill
+# Step 1: Enumerate Rust/Solana/Anchor source, line counts, nSLOC, test & fuzz stats,
+# Solana-specific config signals, docs, commit, and git history stats.
+# Usage: enumerate.sh <project-root> [src-dir]
+# Output: labeled `=== name ===` sections consumed by the x-ray-anchor skill.
 
 set -e
 ROOT="${1:-.}"
-SRC="${2:-src}"
+SRC="${2:-}"
 
 cd "$ROOT"
+
+# Auto-detect source dir if not provided: Anchor uses programs/<name>/src; native uses src/.
+if [ -z "$SRC" ]; then
+  if [ -d programs ]; then SRC="programs"
+  elif [ -d src ]; then SRC="src"
+  else SRC="."; fi
+fi
+
+# Shared find filter for first-party Rust source (excludes build artifacts and tests).
+find_src() {
+  find "$SRC" -name '*.rs' \
+    -not -path '*/target/*' -not -path '*/tests/*' -not -path '*/test/*' \
+    -not -path '*/trident-tests/*' -not -path '*/.anchor/*' \
+    -not -path '*/node_modules/*' -not -path '*/fuzz/*' \
+    -not -path '*/.cargo/*' 2>/dev/null | sort
+}
 
 # ─── Toolchain ────────────────────────────────────────────────────────────────
 
 echo "=== Toolchain ==="
-if [ -f foundry.toml ]; then echo "foundry"
-elif [ -f hardhat.config.js ] || [ -f hardhat.config.ts ]; then echo "hardhat"
+if [ -f Anchor.toml ]; then echo "anchor"
+elif grep -rqsE '^\s*solana-program\s*=|^\s*anchor-lang\s*=' Cargo.toml 2>/dev/null || \
+     ls programs/*/Cargo.toml >/dev/null 2>&1; then echo "native"
+elif [ -f Cargo.toml ]; then echo "cargo"
 else echo "unknown"; fi
+
+# ─── Anchor program IDs (declare_id! / Anchor.toml) ──────────────────────────
+
+echo "=== program_ids ==="
+grep -rhoP 'declare_id!\("\K[^"]+' "$SRC" --include='*.rs' 2>/dev/null | sort -u || true
 
 # ─── Source files with line counts ────────────────────────────────────────────
 
 echo "=== Source (with line counts) ==="
-find "$SRC" -name '*.sol' \
-  -not -path '*/test/*' -not -path '*/tests/*' -not -path '*/script/*' \
-  -not -path '*/lib/*' -not -path '*/node_modules/*' -not -path '*/forge-std/*' \
-  -not -path '*/out/*' -not -path '*/broadcast/*' -not -path '*/artifacts/*' \
-  -not -path '*/cache/*' 2>/dev/null | sort | xargs wc -l 2>/dev/null
+find_src | xargs wc -l 2>/dev/null
 
 # ─── nSLOC (non-blank, non-comment lines) per file ───────────────────────────
+# Rust shares C-style comments with Solidity: // /// //! /* * */
 
 echo "=== nSLOC ==="
 sum=0
@@ -36,113 +57,118 @@ while IFS= read -r f; do
   n=$((t - c))
   printf "%s: %d\n" "$f" "$n"
   sum=$((sum + n))
-done < <(find "$SRC" -name '*.sol' \
-  -not -path '*/test/*' -not -path '*/tests/*' \
-  -not -path '*/script/*' -not -path '*/lib/*' \
-  -not -path '*/node_modules/*' -not -path '*/forge-std/*' \
-  -not -path '*/out/*' -not -path '*/broadcast/*' \
-  -not -path '*/artifacts/*' -not -path '*/cache/*' 2>/dev/null | sort)
+done < <(find_src)
 echo "TOTAL: $sum"
 
-# ─── NatSpec ──────────────────────────────────────────────────────────────────
+# ─── Doc comments (Rust /// //! /** /*!) ─────────────────────────────────────
 
-echo "=== NatSpec ==="
-grep -rcP '@notice|@dev|@param|@return' "$SRC" --include='*.sol' 2>/dev/null | wc -l
+echo "=== doc_comments ==="
+grep -rcP '^\s*///|^\s*//!|/\*\*|/\*!' "$SRC" --include='*.rs' \
+  --exclude-dir=target --exclude-dir=tests --exclude-dir=trident-tests 2>/dev/null \
+  | awk -F: '{s+=$NF}END{print s+0}'
 
-# ─── Tests ────────────────────────────────────────────────────────────────────
+# ─── Solana-specific config / safety signals ─────────────────────────────────
 
-echo "=== test_files ==="
-# Count .sol, .js, .ts test files (Foundry + Hardhat). Hardhat conventions:
-# test files live under test/ or tests/ and typically end in .test.js/.test.ts/.spec.js/.spec.ts,
-# but plain *.js / *.ts under test/ are also valid. We accept anything under a test dir.
-find . \( -name '*.sol' -o -name '*.js' -o -name '*.ts' -o -name '*.mjs' -o -name '*.cjs' \) \
-  -path '*/test*' \
-  -not -path '*/node_modules/*' -not -path '*/lib/*' -not -path '*/forge-std/*' \
-  -not -path '*/out/*' -not -path '*/artifacts/*' -not -path '*/cache/*' \
-  -not -path '*/dist/*' -not -path '*/build/*' -not -path '*/coverage/*' \
-  -not -path '*/typechain*/*' 2>/dev/null | wc -l || echo "0"
-
-echo "=== test_functions ==="
-# Foundry: `function test...` inside a test dir. Hardhat: `it(...)` / `it.only(...)` inside .js/.ts.
-SOL_TESTS=$(grep -rcP 'function test' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | \
-  grep -iP '/(test|tests|invariant|echidna|medusa|halmos|fuzz)/' | awk -F: '{s+=$NF}END{print s+0}')
-JS_TESTS=$(grep -rcP '^\s*it(\.(only|skip))?\s*\(' . \
-  --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=out --exclude-dir=artifacts \
-  --exclude-dir=cache --exclude-dir=dist --exclude-dir=build --exclude-dir=coverage \
-  --exclude-dir=typechain --exclude-dir=typechain-types 2>/dev/null | \
-  grep -iP '/(test|tests|spec|specs)/' | awk -F: '{s+=$NF}END{print s+0}')
-echo $((SOL_TESTS + JS_TESTS))
-
-# ── Stateless Fuzz (Foundry) ──
-echo "=== stateless_fuzz ==="
-grep -rcP 'function\s+testFuzz' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}'
-
-# ── Stateful Fuzz: Foundry invariant tests ──
-echo "=== foundry_invariant ==="
-grep -rcP 'function\s+invariant_' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}'
-
-# ── Stateful Fuzz: Echidna ──
-echo "=== echidna ==="
-ECHIDNA_FUNCS=$(grep -rcP 'function\s+echidna_' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
-ECHIDNA_CONFIGS=$(find . -maxdepth 3 \( -name 'echidna.yaml' -o -name 'echidna_config.yaml' -o -name 'echidna.config.yaml' \) 2>/dev/null | wc -l)
-echo "${ECHIDNA_FUNCS}:${ECHIDNA_CONFIGS}"
-
-# ── Stateful Fuzz: Medusa ──
-echo "=== medusa ==="
-MEDUSA_FUNCS=$(grep -rcP 'function\s+(property_|fuzz_)' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
-MEDUSA_CONFIGS=$(find . -maxdepth 3 \( -name 'medusa.json' \) 2>/dev/null | wc -l)
-echo "${MEDUSA_FUNCS}:${MEDUSA_CONFIGS}"
-
-# ── Hardhat Fuzz ──
-echo "=== hardhat_fuzz ==="
-if [ -f package.json ]; then
-  grep -cP '"@chainlink/hardhat-fuzz"|"hardhat-fuzz"|"@openzeppelin/hardhat-fuzz"' package.json 2>/dev/null || echo "0"
+# overflow-checks: Rust release mode WRAPS by default; Solana programs build in
+# release, so `overflow-checks = true` is a security-critical config signal.
+echo "=== overflow_checks ==="
+if grep -rqsP '^\s*overflow-checks\s*=\s*true' Cargo.toml programs/*/Cargo.toml 2>/dev/null; then
+  echo "enabled"
+elif find . -maxdepth 3 -name 'Cargo.toml' -not -path '*/target/*' 2>/dev/null | xargs grep -lsP '^\s*overflow-checks\s*=\s*true' 2>/dev/null | head -1 | grep -q .; then
+  echo "enabled"
 else
-  echo "0"
+  echo "not_found"
 fi
 
-# ── Fork Tests ──
-echo "=== fork ==="
-grep -rcP 'vm\.createFork|createSelectFork|hardhat_reset|FORKING_URL|forking.*url' . --include='*.sol' --include='*.ts' --include='*.js' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}'
+# init_if_needed: reinitialization attack surface (Anchor feature + usage).
+echo "=== init_if_needed ==="
+grep -rcP 'init_if_needed' "$SRC" --include='*.rs' --exclude-dir=target 2>/dev/null \
+  | awk -F: '{s+=$NF}END{print s+0}'
 
-# ── Formal Verification: Certora ──
-echo "=== certora ==="
-CERTORA_SPECS=$(find . \( -name '*.spec' -o -name '*.cvl' \) 2>/dev/null | \
-  grep -v node_modules | grep -v '/lib/' | wc -l)
-CERTORA_CONF=$(find . -maxdepth 3 \( -name '*.conf' -path '*/certora/*' -o -name 'certora.conf' \) 2>/dev/null | wc -l)
-echo "${CERTORA_SPECS}:${CERTORA_CONF}"
+# unchecked accounts: manual-validation surface (UncheckedAccount / AccountInfo / CHECK).
+echo "=== unchecked_accounts ==="
+grep -rcP 'UncheckedAccount|AccountInfo<|/// CHECK|//\s*CHECK' "$SRC" --include='*.rs' --exclude-dir=target 2>/dev/null \
+  | awk -F: '{s+=$NF}END{print s+0}'
 
-# ── Formal Verification: Halmos ──
-echo "=== halmos ==="
-HALMOS_FUNCS=$(grep -rcP 'function\s+check_' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
-HALMOS_CONF=$(find . -maxdepth 3 -name 'halmos.toml' 2>/dev/null | wc -l)
-echo "${HALMOS_FUNCS}:${HALMOS_CONF}"
+# unsafe blocks.
+echo "=== unsafe_blocks ==="
+grep -rcP '\bunsafe\b' "$SRC" --include='*.rs' --exclude-dir=target 2>/dev/null \
+  | awk -F: '{s+=$NF}END{print s+0}'
 
-# ── Formal Verification: HEVM ──
-echo "=== hevm ==="
-grep -rcP 'function\s+prove_' . --include='*.sol' \
-  --exclude-dir=node_modules --exclude-dir=lib --exclude-dir=forge-std \
-  --exclude-dir=out --exclude-dir=artifacts --exclude-dir=cache 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}'
+# ─── Tests ────────────────────────────────────────────────────────────────────
+# Test PRESENCE is file-scan and ALWAYS reliable, independent of whether the
+# toolchain can build. Coverage execution is separate and best-effort.
+
+echo "=== test_files ==="
+# Rust files with test attributes (inline #[cfg(test)] or test fns) + TS/JS under tests/.
+RS_TEST_FILES=$(grep -rlP '#\[cfg\(test\)\]|#\[tokio::test\]|#\[test\]' . --include='*.rs' \
+  --exclude-dir=target --exclude-dir=node_modules 2>/dev/null | wc -l)
+TS_TEST_FILES=$(find . \( -name '*.ts' -o -name '*.js' -o -name '*.mts' -o -name '*.mjs' \) \
+  \( -path '*/tests/*' -o -path '*/test/*' \) \
+  -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/.anchor/*' \
+  -not -path '*/dist/*' 2>/dev/null | wc -l)
+echo $((RS_TEST_FILES + TS_TEST_FILES))
+
+echo "=== test_functions ==="
+# Rust: #[test] + #[tokio::test]. TS: it()/test() blocks (mocha/jest/vitest).
+RS_TESTS=$(grep -rcP '#\[(tokio::)?test\]' . --include='*.rs' \
+  --exclude-dir=target --exclude-dir=node_modules 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+TS_TESTS=$(grep -rcP '^\s*(it|test)(\.(only|skip|concurrent))?\s*\(' . \
+  --include='*.ts' --include='*.js' --include='*.mts' --include='*.mjs' \
+  --exclude-dir=node_modules --exclude-dir=target --exclude-dir=dist 2>/dev/null \
+  | grep -iP '/(tests?|specs?)/' | awk -F: '{s+=$NF}END{print s+0}')
+echo $((RS_TESTS + TS_TESTS))
+
+# ── Rust unit/integration test functions ──
+echo "=== rust_unit ==="
+grep -rcP '#\[(tokio::)?test\]' . --include='*.rs' \
+  --exclude-dir=target --exclude-dir=node_modules 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}'
+
+# ── TS integration tests (it/describe under tests/) ──
+echo "=== ts_integration ==="
+grep -rcP '^\s*(it|test|describe)(\.(only|skip|concurrent))?\s*\(' . \
+  --include='*.ts' --include='*.js' --include='*.mts' --include='*.mjs' \
+  --exclude-dir=node_modules --exclude-dir=target --exclude-dir=dist 2>/dev/null \
+  | grep -iP '/(tests?|specs?)/' | awk -F: '{s+=$NF}END{print s+0}'
+
+# ── Local validator harnesses: bankrun / litesvm / solana-program-test / mollusk ──
+echo "=== litesvm_bankrun ==="
+LSB_FUNCS=$(grep -rcP 'litesvm|solana-bankrun|anchor-bankrun|solana_program_test|ProgramTest|mollusk' . \
+  --include='*.rs' --include='*.ts' --include='*.js' \
+  --exclude-dir=node_modules --exclude-dir=target 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+LSB_CONF=$(grep -rlsP 'litesvm|solana-bankrun|anchor-bankrun|solana-program-test|mollusk' \
+  Cargo.toml programs/*/Cargo.toml package.json 2>/dev/null | wc -l)
+echo "${LSB_FUNCS}:${LSB_CONF}"
+
+# ── Trident fuzzing (Ackee) ──
+echo "=== trident ==="
+TRIDENT_FUNCS=$(grep -rcP 'trident_fuzz|use trident|#\[derive\(.*FuzzTestExecutor|fuzz_ix|FuzzInstruction' . \
+  --include='*.rs' --exclude-dir=target 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+TRIDENT_CONF=$(find . -maxdepth 3 \( -name 'Trident.toml' -o -name 'trident.toml' \) 2>/dev/null | wc -l)
+TRIDENT_DIR=$(find . -maxdepth 2 -type d -name 'trident-tests' 2>/dev/null | wc -l)
+echo "${TRIDENT_FUNCS}:$((TRIDENT_CONF + TRIDENT_DIR))"
+
+# ── cargo-fuzz (libFuzzer) ──
+echo "=== cargo_fuzz ==="
+CF_FUNCS=$(grep -rcP 'fuzz_target!' . --include='*.rs' --exclude-dir=target 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+CF_DIR=$(find . -maxdepth 2 -type d -name 'fuzz' 2>/dev/null | wc -l)
+echo "${CF_FUNCS}:${CF_DIR}"
+
+# ── Property testing: proptest / quickcheck ──
+echo "=== proptest ==="
+grep -rcP 'proptest!|#\[quickcheck\]|prop_assert' . --include='*.rs' --exclude-dir=target 2>/dev/null \
+  | awk -F: '{s+=$NF}END{print s+0}'
+
+# ── Formal verification: Kani / Certora Solana ──
+echo "=== kani ==="
+KANI_FUNCS=$(grep -rcP '#\[kani::proof\]|kani::' . --include='*.rs' --exclude-dir=target 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+CERTORA_CONF=$(find . \( -name '*.spec' -o -name '*.conf' -path '*certora*' \) 2>/dev/null | grep -v node_modules | grep -v '/target/' | wc -l)
+echo "${KANI_FUNCS}:${CERTORA_CONF}"
 
 # ─── Docs ─────────────────────────────────────────────────────────────────────
 
 echo "=== docs ==="
-ls -d README.md README* docs/ doc/ whitepapers/ whitepaper/ spec/ specs/ paper/ papers/ 2>/dev/null || true
+ls -d README.md README* docs/ doc/ whitepapers/ whitepaper/ spec/ specs/ paper/ papers/ audits/ 2>/dev/null || true
 
 echo "=== commit ==="
 git rev-parse --short HEAD 2>/dev/null || echo "unknown"
@@ -170,7 +196,7 @@ echo "=== git_merge_count ==="
 git log --merges --oneline | wc -l
 
 echo "=== git_hotspots ==="
-git log --name-only --format='' -- "$SRC" | sort | uniq -c | sort -rn | head -15
+git log --name-only --format='' -- "$SRC" | grep -E '\.rs$' | sort | uniq -c | sort -rn | head -15
 
 echo "=== git_recent_30d ==="
 git log --since='30 days ago' --oneline -- "$SRC" | head -20
