@@ -2,14 +2,10 @@
 
 Know your Solana program before auditors do.
 
-A pre-audit readiness report generator for **Rust / Solana / Anchor** programs. Adapted from the
-Solidity/EVM `x-ray` skill and re-grounded in Solana's account model — where the dominant bug surface is
-account validation (signer, owner, PDA, CPI), not just protocol economics.
-
 Built for:
 
-- **Protocol teams** preparing for an audit — fix the obvious so auditors focus on what matters.
-- **Security researchers** starting a new engagement — get the full picture of a program in minutes.
+- **Protocol teams** preparing for an audit — fix the obvious so auditors can focus on what matters
+- **Security researchers** starting a new engagement — get the full picture in minutes
 
 Not a vulnerability scanner — it's the briefing you read before opening the first `.rs` file.
 

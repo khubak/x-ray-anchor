@@ -7,6 +7,13 @@ on:
       - '**'
       - '!VERSION'
       - '!.github/**'
+      - '!README.md'
+      - '!CLAUDE.md'
+      - '!CONTRIBUTING.md'
+      - '!CODE_OF_CONDUCT.md'
+      - '!SECURITY.md'
+      - '!LICENSE'
+      - '!.gitignore'
 
 jobs:
   bump:
