@@ -54,10 +54,13 @@ Install (copy the folder into your skills directory):
 Then, in a Solana/Anchor repo:
 
 ```
-x-ray-anchor
+/x-ray-anchor
 ```
 
-or "x-ray this anchor program" / "pre-audit this solana program".
+or
+```
+"/x-ray-anchor this program" / "pre-audit this solana program".
+```
 
 ## Tips
 
