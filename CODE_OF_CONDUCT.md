@@ -21,7 +21,7 @@ We are committed to making participation in this project a welcoming, respectful
 
 ## Enforcement
 
-Report violations to the maintainers via the contact on the [GitHub profile](https://github.com/pashov). All reports are reviewed and investigated confidentially. Maintainers may remove contributions or restrict access for violations of this code.
+Report violations to the maintainers via the contact on the [GitHub profile](https://github.com/khubak). All reports are reviewed and investigated confidentially. Maintainers may remove contributions or restrict access for violations of this code.
 
 ## Scope
 

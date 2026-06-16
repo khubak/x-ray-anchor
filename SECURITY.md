@@ -4,7 +4,7 @@
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Email the maintainers directly via the contact on the [GitHub profile](https://github.com/pashov). Include:
+Email the maintainers directly via the contact on the [GitHub profile](https://github.com/khubak). Include:
 
 - Description of the vulnerability
 - Steps to reproduce
