@@ -1,4 +1,4 @@
-# X-Ray Anchor
+<img src="x-ray-anchor.png" alt="X-Ray Anchor" width="100%">
 
 Know your Solana program before auditors do.
 
